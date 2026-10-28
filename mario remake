@@ -157,6 +157,7 @@ P.face, P.ground, P.coyote, P.buf, P.jheld = 1, False, 0.0, 0.0, False
 P.dead, P.dT, P.cd, P.inv, P.multi = False, 0.0, 0.0, 0.0, 0.0
 P.cut, P.air = False, 1
 P.squash = 0.0
+P.rph = 0.0  # run-cycle phase, integrated smoothly every frame
 
 
 def make_level(n):
@@ -279,6 +280,7 @@ def reset_player(at=None):
     P.dead = False
     P.cd = 0.0
     P.squash = 0.0
+    P.rph = 0.0
 
 
 def solid(tx, ty):
@@ -515,10 +517,18 @@ LAYERS, pollen = {}, []
 
 def build_art():
     run = []
-    for i in range(24):
-        ph = i / 24 * 6.2832
-        bob = int(abs(math.cos(ph)) * -2)
-        run.append(_hero_frame(((38 + math.sin(ph + 3.1416) * 10, 68), (38 + math.sin(ph) * 10, 68)), bob, False))
+    for i in range(96):  # 96-pose circular run cycle: stance slides the foot back,
+        ph = i / 96.0    # swing lifts it forward - no seam, no quantized bob
+        bob = abs(math.cos((ph - 0.225) * 6.2832)) * 1.6 - 0.8  # dip at mid-stance, float in flight
+
+        def foot(off):
+            p = (ph + off) % 1.0
+            if p < 0.45:  # planted: slides from front to back
+                return (38 + 8 - 16 * (p / 0.45), 68.0)
+            t = (p - 0.45) / 0.55  # airborne: arcs forward
+            return (38 - 8 + 16 * t, 68.0 - math.sin(t * 3.1416) * 8)
+
+        run.append(_hero_frame((foot(0.0), foot(0.5)), bob, False))
     idle = [_hero_frame(((33, 68), (43, 68)), 0, False),
             _hero_frame(((33, 68), (43, 68)), 1, False),
             _hero_frame(((33, 68), (43, 68)), 0, True)]
@@ -669,6 +679,8 @@ def update(dt):
     banner = max(0.0, banner - dt)
     flash = max(0.0, flash - dt)
     P.squash = 0.0 if abs(P.squash) < 0.01 else P.squash * max(0.0, 1 - dt * 6)
+    if P.ground and abs(P.vx) > 10:  # integrate run phase: smooth at any fps, speed-scaled
+        P.rph += dt * (1.1 + abs(P.vx) / 140.0)
     P.cd = max(0.0, P.cd - dt)
     P.inv = max(0.0, P.inv - dt)
     P.multi = max(0.0, P.multi - dt)
@@ -962,7 +974,7 @@ def draw_player():
     if P.inv > 0 and not P.dead and int(t_now * 14) % 2:
         return
     if P.ground and abs(P.vx) > 10:
-        frames, idx = ART["hero_run"], int(t_now * 24) % len(ART["hero_run"])
+        frames, idx = ART["hero_run"], int((P.rph % 1.0) * len(ART["hero_run"])) % len(ART["hero_run"])
     elif P.ground:
         frames, idx = ART["hero_idle"], int(t_now * 1.6) % 3
     elif P.vy < 0:
