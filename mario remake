@@ -1336,14 +1336,13 @@ def main():
                 DBG["open"] = not DBG["open"]
         update(dt)
         draw()
-        present()
-        fps_hist.append(clock.get_fps())
-        del fps_hist[:-140]
-        if shake > 0:
+        if shake > 0:  # camera shake must happen before the frame is presented
             snap = screen.copy()
             screen.fill((0, 0, 0))
             screen.blit(snap, (random.randint(-5, 5), random.randint(-5, 5)))
-        pygame.display.flip()
+        present()
+        fps_hist.append(clock.get_fps())
+        del fps_hist[:-140]
 
 
 if __name__ == "__main__":
