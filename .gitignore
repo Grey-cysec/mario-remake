@@ -1,0 +1,10 @@
+# backups of the original project - never belong in the repo
+*.bak
+*.bak.*
+
+# python
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store

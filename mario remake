@@ -1,0 +1,1350 @@
+"""Homing Bow Bros - Mario-like platformer with a self-aiming bow.
+Run:  pip install pygame   then   python3 "mario remake"
+Controls: arrows/A-D move, Space/Up/W jump, F shoot (arrows home in), Enter start/restart, F1 debug panel, Esc quit.
+"""
+import math
+import random
+import struct
+import sys
+import pygame
+
+T, W, H, ROWS = 30, 800, 450, 15  # logical resolution - the shader stage scales it up to the screen
+pygame.init()
+INFO = pygame.display.Info()
+WIN_W, WIN_H = INFO.current_w, INFO.current_h
+
+# ---------------- display + shader pipeline ----------------
+# The game always draws to the 800x450 `screen` canvas; present() then scales it,
+# with GPU post-processing (bloom, colour grading, vignette) when OpenGL is available.
+SH = {"bloom": 0.85, "threshold": 0.5, "sat": 1.15, "contrast": 1.06, "vig": 0.3}
+GL = {"ok": False}
+try:
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_PROFILE_MASK, pygame.GL_CONTEXT_PROFILE_CORE)
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MAJOR_VERSION, 3)
+    pygame.display.gl_set_attribute(pygame.GL_CONTEXT_MINOR_VERSION, 3)
+    window = pygame.display.set_mode((WIN_W, WIN_H), pygame.OPENGL | pygame.DOUBLEBUF | pygame.NOFRAME)
+    import moderngl
+    ctx = moderngl.create_context()
+    VERT = """#version 330
+    in vec2 in_pos;
+    in vec2 in_uv;
+    out vec2 uv;
+    void main() {
+        uv = vec2(in_uv.x, 1.0 - in_uv.y);
+        gl_Position = vec4(in_pos, 0.0, 1.0);
+    }"""
+    BRIGHT = """#version 330
+    uniform sampler2D u_tex;
+    uniform float u_threshold;
+    in vec2 uv;
+    out vec4 f_color;
+    void main() {
+        vec3 c = texture(u_tex, uv).rgb;
+        float l = dot(c, vec3(0.299, 0.587, 0.114));
+        f_color = vec4(c * smoothstep(u_threshold, u_threshold + 0.3, l), 1.0);
+    }"""
+    BLUR = """#version 330
+    uniform sampler2D u_tex;
+    uniform vec2 u_dir;
+    in vec2 uv;
+    out vec4 f_color;
+    void main() {
+        vec4 s = texture(u_tex, uv) * 0.227027;
+        s += (texture(u_tex, uv + u_dir * 1.3846154) + texture(u_tex, uv - u_dir * 1.3846154)) * 0.3162162;
+        s += (texture(u_tex, uv + u_dir * 3.2307692) + texture(u_tex, uv - u_dir * 3.2307692)) * 0.0702703;
+        f_color = s;
+    }"""
+    FINAL = """#version 330
+    uniform sampler2D u_tex;
+    uniform sampler2D u_bloom_tex;
+    uniform vec2 u_scale;
+    uniform float u_bloom, u_sat, u_contrast, u_vig, u_time;
+    in vec2 uv;
+    out vec4 f_color;
+    void main() {
+        vec2 suv = 0.5 + (uv - 0.5) * u_scale;  // aspect-correct letterbox
+        if (suv.x < 0.0 || suv.x > 1.0 || suv.y < 0.0 || suv.y > 1.0) {
+            f_color = vec4(0.0, 0.0, 0.0, 1.0);
+            return;
+        }
+        vec3 c = texture(u_tex, suv).rgb;
+        c += texture(u_bloom_tex, suv).rgb * u_bloom;
+        float l = dot(c, vec3(0.299, 0.587, 0.114));
+        c = mix(vec3(l), c, u_sat);
+        c = (c - 0.5) * u_contrast + 0.5;
+        c = pow(max(c, 0.0), vec3(0.96));
+        c *= vec3(1.03, 1.0, 0.975);  // gentle warm grade
+        vec2 d = suv - 0.5;
+        c *= 1.0 - dot(d, d) * u_vig * 1.8;
+        float grain = fract(sin(dot(suv + u_time, vec2(12.9898, 78.233))) * 43758.5453);
+        c += (grain - 0.5) * 0.012;  // faint film grain keeps upscales from looking flat
+        f_color = vec4(clamp(c, 0.0, 1.0), 1.0);
+    }"""
+    prog_bright = ctx.program(vertex_shader=VERT, fragment_shader=BRIGHT)
+    prog_blur = ctx.program(vertex_shader=VERT, fragment_shader=BLUR)
+    prog_final = ctx.program(vertex_shader=VERT, fragment_shader=FINAL)
+    quad = ctx.buffer(struct.pack("16f", -1, -1, 0, 0, 1, -1, 1, 0, -1, 1, 0, 1, 1, 1, 1, 1))
+    vao_bright = ctx.vertex_array(prog_bright, [(quad, "2f 2f", "in_pos", "in_uv")])
+    vao_blur = ctx.vertex_array(prog_blur, [(quad, "2f 2f", "in_pos", "in_uv")])
+    vao_final = ctx.vertex_array(prog_final, [(quad, "2f 2f", "in_pos", "in_uv")])
+    tex = ctx.texture((W, H), 3)
+    tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+    qw, qh = W // 4, H // 4
+    def _make_fbo():
+        t = ctx.texture((qw, qh), 3)
+        t.filter = (moderngl.LINEAR, moderngl.LINEAR)
+        return ctx.framebuffer(color_attachments=[t])
+    GL.update(ctx=ctx, tex=tex, fbo_a=_make_fbo(), fbo_b=_make_fbo(), qw=qw, qh=qh,
+              vao_bright=vao_bright, vao_blur=vao_blur, vao_final=vao_final,
+              prog_bright=prog_bright, prog_blur=prog_blur, prog_final=prog_final,
+              scale=(max(WIN_W / WIN_H / (W / H), 1.0), max((W / H) / (WIN_W / WIN_H), 1.0)))
+    GL["ok"] = True
+except Exception as _ex:
+    print("Shader pipeline unavailable, using plain renderer:", _ex)
+    window = pygame.display.set_mode((WIN_W, WIN_H), pygame.NOFRAME)
+
+screen = pygame.Surface((W, H))  # every drawing routine paints this canvas
+pygame.display.set_caption("Homing Bow Bros")
+clock = pygame.time.Clock()
+
+
+def to_canvas(mx, my):
+    """Map mouse position from the window into 800x450 canvas space (letterbox-aware)."""
+    s = min(WIN_W / W, WIN_H / H)
+    return (mx - (WIN_W - W * s) / 2) / s, (my - (WIN_H - H * s) / 2) / s
+F_SM = pygame.font.SysFont(None, 24)
+F_MD = pygame.font.SysFont(None, 36)
+F_BG = pygame.font.SysFont(None, 72)
+
+# cached surfaces: these used to be rebuilt every frame, which caused stutter
+_TEXT_CACHE, _ARROW_ROT, _CP_GLOW = {}, {}, {}
+_ARROW_GLOW = None
+_HEART_GLOW = None
+_BG_GRAD = None
+
+# ---------------- tuning & debug state (live-editable in the F1 panel) ----------------
+TUNE = {"max_spd": 230.0, "grav": 1500.0, "jump": -640.0, "jump2": -570.0,
+        "arrow_spd": 520.0, "turn": 9.0}
+DBG = {"open": False, "god": False}
+fps_hist, flash = [], 0.0
+UI_F = pygame.font.SysFont(None, 19)
+UI = {"s": None, "x": 0, "y": 0, "w": 0, "cx": 0, "cy": 0, "mx": 0, "my": 0, "down": False, "click": False}
+
+
+class Body:
+    def __init__(self, x, y, w, h):
+        self.x, self.y, self.w, self.h = x, y, w, h
+        self.vx = self.vy = 0.0
+
+
+# ---------------- game state ----------------
+grid = []
+cols = 0
+enemies, coins, arrows, parts = [], [], [], []
+powers, fireballs, cps = [], [], []
+lvl_score = 0
+shake = 0.0
+flag_x = 0
+cp = None
+state = "title"
+lvl, lives, score = 0, 3, 0
+cam = 0.0
+banner, banner_txt = 0.0, None
+t_now = 0.0
+P = Body(0, 0, 22, 28)
+P.face, P.ground, P.coyote, P.buf, P.jheld = 1, False, 0.0, 0.0, False
+P.dead, P.dT, P.cd, P.inv, P.multi = False, 0.0, 0.0, 0.0, 0.0
+P.cut, P.air = False, 1
+P.squash = 0.0
+
+
+def make_level(n):
+    global grid, cols, enemies, coins, arrows, parts, flag_x, cp, powers, fireballs, cps, lvl_score
+    r = random.Random(n * 97 + 13)
+    cols = 110 + n * 16
+    grid = [[0] * cols for _ in range(ROWS)]
+    enemies, coins, arrows, parts = [], [], [], []
+    powers, fireballs, cps = [], [], []
+    cp = None
+
+    def put(x, y, v):
+        if 0 <= x < cols and 0 <= y < ROWS:
+            grid[y][x] = v
+
+    def ground(a, b):
+        for x in range(a, b):
+            put(x, 13, 1)
+            put(x, 14, 1)
+
+    ground(0, 18)
+    x = 18
+    while x < cols - 24:
+        gap = r.randint(2, 3 if n == 0 else 4)
+        ln = r.randint(8, 19)
+        a, b = x + gap, min(x + gap + ln, cols - 22)
+        ln = b - a
+        for i in range(gap):
+            coins.append({"x": (x + i) * T + 8, "y": 9 * T + 14, "got": False})
+        ground(a, b)
+        plat = (-9, -9)
+        if ln >= 9 and r.random() < 0.85:
+            px, row = a + 2, 10
+            plat = (px, px)
+            for k in range(r.randint(3, 4 + min(n, 2))):
+                pl = r.randint(2, 3)
+                if px + pl > b - 1:
+                    break
+                for i in range(pl):
+                    put(px + i, row, 2)
+                    coins.append({"x": (px + i) * T + 8, "y": (row - 1) * T + 6, "got": False})
+                plat = (plat[0], px + pl)
+                if k == 2 and r.random() < 0.6:
+                    powers.append({"x": px * T + 4, "y": (row - 1) * T, "k": "heart" if r.random() < 0.3 else "star", "got": False})
+                px += pl + r.randint(1, 2)
+                row = max(8, min(10, row + r.choice((-2, -1, 1, 2))))
+        if ln >= 10 and r.random() < 0.2 + n * 0.12:
+            for _try in range(6):
+                sx = a + 4 + r.randint(0, ln - 8)
+                if sx + 1 < plat[0] - 1 or sx > plat[1] + 1:
+                    put(sx, 12, 3)
+                    if r.random() < 0.5:
+                        put(sx + 1, 12, 3)
+                    break
+        for _ in range(r.randint(1, 2 + min(n, 2))):
+            e = Body((a + 3 + r.random() * max(1, ln - 5)) * T, 12 * T, 24, 24)
+            e.t, e.vx = "w", r.choice((-1, 1)) * (45 + n * 10)
+            e.dead, e.dT = False, 0.0
+            enemies.append(e)
+        if r.random() < 0.5 + n * 0.1:
+            by = (5 + r.random() * 4) * T
+            bx = (a + r.random() * ln) * T
+            # keep bats out of brick platforms: retry higher air until the cell is clear
+            for _try in range(10):
+                if not any(solid(cx, cy)
+                           for cy in range(int(by // T), int((by + 19) // T) + 1)
+                           for cx in range(int(bx // T), int((bx + 25) // T) + 1)):
+                    break
+                by, bx = (3 + r.random() * 2) * T, (a + r.random() * ln) * T
+            else:
+                by, bx = 3 * T, (a + ln / 2) * T
+            e = Body(bx, by, 26, 20)
+            e.t, e.base, e.ph, e.dead, e.dT = "b", by, r.random() * 6, False, 0.0
+            enemies.append(e)
+        x = b
+    ground(cols - 22, cols)
+    flag_x = (cols - 5) * T
+    boss = Body((cols - 12) * T, 9 * T, 56, 60)
+    boss.t, boss.hp, boss.maxhp, boss.tm, boss.fire = "X", 8 + 3 * n, 8 + 3 * n, 0.0, 2.0
+    boss.flash, boss.dead, boss.dT = 0.0, False, 0.0
+    enemies.append(boss)
+    for e in enemies:
+        e.sx, e.sy, e.svx = e.x, e.y, e.vx
+    def clear_spot(cx):
+        return (0 < cx < cols - 2 and grid[13][cx] == 1 and grid[13][cx + 1] == 1 and
+                all(grid[y][cx + k] == 0 for y in (9, 10, 11, 12) for k in (-1, 0, 1, 2)))
+
+    for frac in (0.38, 0.68):
+        x, spot = int(cols * frac), None
+        while x < cols - 26:
+            if clear_spot(x):
+                spot = x
+                break
+            x += 1
+        if spot is None:  # nothing ahead: fall back to the nearest safe ground behind it
+            for cx in range(min(int(cols * frac), cols - 27), 1, -1):
+                if clear_spot(cx):
+                    spot = cx
+                    break
+        cps.append({"x": (spot if spot is not None else 2) * T, "on": False})
+    lvl_score = score
+    reset_player()
+    P.inv = 1.0
+
+
+def safe_footing(px):
+    """Column with solid ground under the spawn height, nearest to px (never a pit)."""
+    tx = int((px + P.w // 2) // T)
+    for d in (0, -1, 1, -2, 2, -3, 3):
+        if 0 <= tx + d < cols and grid[13][tx + d] == 1:
+            return (tx + d) * T + T // 2 - P.w // 2
+    return 2 * T
+
+
+def reset_player(at=None):
+    P.x, P.y = at if at else (2 * T, 12 * T - P.h)
+    if at:  # safety net: a checkpoint must never dump the player into a pit
+        P.x = safe_footing(P.x)
+    P.vx = P.vy = 0.0
+    P.dead = False
+    P.cd = 0.0
+    P.squash = 0.0
+
+
+def solid(tx, ty):
+    if tx < 0 or tx >= cols:
+        return True
+    if ty < 0 or ty >= ROWS:
+        return False
+    return grid[ty][tx] in (1, 2)
+
+
+def tile_range(e):
+    return (int(e.x // T), int((e.x + e.w - 1) // T), int(e.y // T), int((e.y + e.h - 1) // T))
+
+
+def move_x(e, dt):
+    dx = e.vx * dt
+    steps = int(abs(dx) // 8) + 1
+    hit = False
+    for _ in range(steps):
+        e.x += dx / steps
+        x0, x1, y0, y1 = tile_range(e)
+        for y in range(y0, y1 + 1):
+            for x in range(x0, x1 + 1):
+                if solid(x, y):
+                    if dx > 0:
+                        e.x = x * T - e.w
+                    elif dx < 0:
+                        e.x = (x + 1) * T
+                    hit = True
+        if hit:
+            e.vx = 0.0
+            break
+    return hit
+
+
+def move_y(e, dt):
+    dy = e.vy * dt
+    steps = int(abs(dy) // 8) + 1
+    on = False
+    for _ in range(steps):
+        e.y += dy / steps
+        x0, x1, y0, y1 = tile_range(e)
+        hit = False
+        for y in range(y0, y1 + 1):
+            for x in range(x0, x1 + 1):
+                if solid(x, y):
+                    if dy > 0:
+                        e.y, on = y * T - e.h, True
+                    elif dy < 0:
+                        e.y = (y + 1) * T
+                    hit = True
+        if hit:
+            e.vy = 0.0
+            break
+    return on
+
+
+def overlap(a, b):
+    return a.x < b.x + b.w and a.x + a.w > b.x and a.y < b.y + b.h and a.y + a.h > b.y
+
+
+def burst(x, y, col, n=12, sp=200):
+    for _ in range(n):
+        a, s = random.random() * 6.28, random.random() * sp
+        parts.append([x, y, math.cos(a) * s, math.sin(a) * s - 80, 0.6 + random.random() * 0.4, col])
+
+
+def radial(radius, col, peak):
+    """Soft radial-gradient blob, cached - used for glows and the sun halo."""
+    key = (radius, col, peak)
+    g = radial.cache.get(key)
+    if g is None:
+        g = pygame.Surface((radius * 2, radius * 2), pygame.SRCALPHA)
+        for r in range(radius, 0, -1):
+            pygame.draw.circle(g, (*col, int(peak * (1 - r / radius) ** 1.6)), (radius, radius), r)
+        radial.cache[key] = g
+    return g
+radial.cache = {}
+
+
+def tile_img(v, exposed, variant):
+    """Pre-rendered tile sprites - nicer to look at and far cheaper than redrawing."""
+    key = (v, exposed, variant)
+    s = tile_img.cache.get(key)
+    if s is None:
+        s = pygame.Surface((T, T), pygame.SRCALPHA)
+        if v == 1:  # dirt with grass cap and blades when the top is exposed
+            pygame.draw.rect(s, (139, 90, 43), (0, 0, T, T))
+            pygame.draw.rect(s, (112, 72, 34), (0, T - 3, T, 3))
+            for sx, sy in ((6, 12), (19, 18), (12, 24), (23, 20)):
+                if (sx * 3 + sy + variant * 5) % 4 < 2:
+                    pygame.draw.rect(s, (124, 81, 38), (sx, sy, 3, 3))
+            if exposed:
+                pygame.draw.rect(s, (76, 175, 80), (0, 0, T, 7))
+                pygame.draw.rect(s, (110, 205, 108), (0, 0, T, 2))
+                for i in range(4):
+                    bx = (i * 8 + variant * 3) % (T - 2)
+                    pygame.draw.rect(s, (92, 195, 95), (bx, 3, 2, 5))
+                    pygame.draw.rect(s, (120, 215, 120), (bx, 3, 1, 3))
+                if variant == 2:  # occasional flowers
+                    for fx_, col in ((7, (255, 96, 116)), (21, (140, 165, 255))):
+                        pygame.draw.rect(s, (80, 150, 80), (fx_, 3, 1, 4))
+                        pygame.draw.circle(s, col, (fx_, 2), 2)
+                        pygame.draw.circle(s, (255, 250, 220), (fx_, 2), 1)
+        elif v == 2:  # bevelled brick
+            pygame.draw.rect(s, (200, 96, 42), (0, 0, T, T))
+            pygame.draw.rect(s, (226, 126, 66), (1, 1, T - 2, 5))
+            pygame.draw.rect(s, (122, 53, 19), (0, 0, T, T), 2)
+            pygame.draw.line(s, (122, 53, 19), (0, 15), (T, 15), 2)
+            pygame.draw.line(s, (122, 53, 19), (7, 15), (7, T), 2)
+        else:  # steel spikes with shine
+            pygame.draw.rect(s, (105, 70, 40), (0, T - 6, T, 6))
+            for i in range(3):
+                pygame.draw.polygon(s, (158, 160, 180), [(i * 10, T - 4), (i * 10 + 5, 8), (i * 10 + 10, T - 4)])
+                pygame.draw.polygon(s, (228, 232, 245), [(i * 10 + 2, T - 4), (i * 10 + 5, 10), (i * 10 + 6, T - 4)])
+        tile_img.cache[key] = s
+    return s
+tile_img.cache = {}
+
+
+# ---------------- hand-built animated art (pre-rendered once at startup) ----------------
+ART = {}
+
+
+def _limb(s, x1, y1, x2, y2, wdt, col):
+    dx, dy = x2 - x1, y2 - y1
+    ln = max(1.0, math.hypot(dx, dy))
+    nx, ny = -dy / ln * wdt / 2, dx / ln * wdt / 2
+    pygame.draw.polygon(s, col, [(x1 + nx, y1 + ny), (x2 + nx, y2 + ny), (x2 - nx, y2 - ny), (x1 - nx, y1 - ny)])
+    pygame.draw.circle(s, col, (int(x1), int(y1)), int(wdt / 2))
+    pygame.draw.circle(s, col, (int(x2), int(y2)), int(wdt / 2))
+
+
+def _hero_frame(feet, bob, blink, crouch=0.0):
+    """One archer pose on a 76x76 canvas, facing right."""
+    s = pygame.Surface((76, 76), pygame.SRCALPHA)
+    hip = (38, 50 + bob + crouch)
+    _limb(s, hip[0] - 2, hip[1], feet[0][0], feet[0][1], 7, (30, 55, 160))
+    _limb(s, hip[0] + 2, hip[1], feet[1][0], feet[1][1], 7, (42, 75, 214))
+    pygame.draw.rect(s, (74, 46, 24), (feet[0][0] - 5, feet[0][1] - 3, 10, 6), border_radius=2)
+    pygame.draw.rect(s, (92, 58, 30), (feet[1][0] - 5, feet[1][1] - 3, 10, 6), border_radius=2)
+    pygame.draw.line(s, (120, 80, 40), (27, 44 + bob), (18, 27 + bob), 7)  # quiver
+    for oy in (0, 4):
+        pygame.draw.line(s, (210, 210, 215), (18, 27 + bob), (14, 19 + bob + oy), 2)
+        pygame.draw.polygon(s, (235, 90, 90), [(13, 18 + bob + oy), (19, 20 + bob + oy), (15, 23 + bob + oy)])
+    pygame.draw.rect(s, (214, 42, 42), (28, 34 + bob + crouch, 20, 18), border_radius=4)   # shirt
+    pygame.draw.rect(s, (168, 30, 30), (28, 46 + bob + crouch, 20, 4))                      # hem
+    pygame.draw.rect(s, (60, 40, 20), (28, 48 + bob + crouch, 20, 4))                       # belt
+    pygame.draw.rect(s, (255, 205, 60), (35, 48 + bob + crouch, 6, 4))                      # buckle
+    pygame.draw.rect(s, (241, 194, 125), (30, 20 + bob + crouch, 16, 14), border_radius=3)  # head
+    pygame.draw.polygon(s, (241, 194, 125), [(46, 26 + bob + crouch), (50, 28 + bob + crouch), (46, 30 + bob + crouch)])
+    if blink:
+        pygame.draw.line(s, (60, 40, 20), (40, 26 + bob + crouch), (44, 26 + bob + crouch), 2)
+    else:
+        pygame.draw.rect(s, (25, 20, 15), (41, 24 + bob + crouch, 3, 4))
+    pygame.draw.line(s, (60, 40, 20), (40, 22 + bob + crouch), (45, 22 + bob + crouch), 1)  # brow
+    pygame.draw.polygon(s, (214, 42, 42), [(28, 22 + bob + crouch), (48, 22 + bob + crouch),
+                                           (46, 14 + bob + crouch), (32, 12 + bob + crouch)])  # hat
+    pygame.draw.rect(s, (168, 30, 30), (26, 21 + bob + crouch, 24, 3))                      # brim
+    _limb(s, 46, 38 + bob + crouch, 56, 42 + bob + crouch, 6, (214, 42, 42))                # bow arm
+    pygame.draw.circle(s, (241, 194, 125), (56, 42 + bob + crouch), 3)
+    pygame.draw.arc(s, (90, 51, 16), (50, 30 + bob + crouch, 14, 26), -1.3, 1.3, 3)
+    pygame.draw.line(s, (235, 235, 235), (52, 32 + bob + crouch), (52, 54 + bob + crouch), 1)
+    return s
+
+
+def _walker_frame(shuffle, blink):
+    s = pygame.Surface((28, 28), pygame.SRCALPHA)
+    pygame.draw.ellipse(s, (139, 69, 19), (1, 1, 26, 22))
+    pygame.draw.arc(s, (110, 52, 12), (3, 3, 22, 18), 3.5, 6.1, 3)
+    pygame.draw.rect(s, (243, 214, 160), (3 + shuffle, 22, 10, 5), border_radius=2)
+    pygame.draw.rect(s, (243, 214, 160), (15 - shuffle, 22, 10, 5), border_radius=2)
+    if blink:
+        pygame.draw.line(s, (20, 12, 5), (6, 9), (11, 9), 2)
+        pygame.draw.line(s, (20, 12, 5), (16, 9), (21, 9), 2)
+    else:
+        pygame.draw.rect(s, (255, 255, 255), (6, 5, 5, 6))
+        pygame.draw.rect(s, (255, 255, 255), (15, 5, 5, 6))
+        pygame.draw.rect(s, (0, 0, 0), (8, 7, 2, 3))
+        pygame.draw.rect(s, (0, 0, 0), (17, 7, 2, 3))
+    pygame.draw.line(s, (60, 30, 8), (5, 3), (10, 5), 2)  # angry brows
+    pygame.draw.line(s, (60, 30, 8), (22, 3), (17, 5), 2)
+    return s
+
+
+def _bat_frame(wy):
+    s = pygame.Surface((40, 30), pygame.SRCALPHA)
+    cx, cy = 20, 15
+    for sgn in (-1, 1):
+        pygame.draw.polygon(s, (88, 52, 132), [(cx + sgn * 6, cy), (cx + sgn * 13, cy + wy),
+                                               (cx + sgn * 18, cy + wy * 0.5 + 2), (cx + sgn * 19, cy + 7),
+                                               (cx + sgn * 12, cy + 5), (cx + sgn * 6, cy + 6)])
+    pygame.draw.ellipse(s, (106, 63, 160), (12, 7, 16, 18))
+    pygame.draw.circle(s, (140, 90, 190), (20, 21), 5)
+    pygame.draw.polygon(s, (106, 63, 160), [(13, 9), (11, 1), (18, 7)])  # ears
+    pygame.draw.polygon(s, (106, 63, 160), [(27, 9), (29, 1), (22, 7)])
+    pygame.draw.rect(s, (255, 255, 68), (15, 11, 3, 3))
+    pygame.draw.rect(s, (255, 255, 68), (22, 11, 3, 3))
+    pygame.draw.polygon(s, (255, 255, 255), [(17, 16), (18, 19), (19, 16)])
+    return s
+
+
+def _boss_frame(open_mouth, breath):
+    s = pygame.Surface((70, 80), pygame.SRCALPHA)
+    y0 = 10 + breath
+    pygame.draw.ellipse(s, (150, 30, 40), (7, y0 + 8, 56, 60))
+    pygame.draw.ellipse(s, (122, 22, 32), (11, y0 + 38, 48, 28))  # belly shade
+    pygame.draw.polygon(s, (240, 230, 200), [(13, y0 + 14), (9, y0 - 6), (25, y0 + 8)])   # horns
+    pygame.draw.polygon(s, (240, 230, 200), [(57, y0 + 14), (61, y0 - 6), (45, y0 + 8)])
+    for ox in (11, 31):
+        pygame.draw.circle(s, (255, 255, 255), (ox + 7, y0 + 26), 8)
+        pygame.draw.circle(s, (20, 0, 0), (ox + 10, y0 + 27), 4)
+        pygame.draw.line(s, (70, 0, 0), (ox + 3, y0 + 15), (ox + 12, y0 + 19), 3)         # angry brows
+    if open_mouth:
+        pygame.draw.rect(s, (40, 0, 0), (19, y0 + 39, 32, 16), border_radius=3)
+        for i in range(4):
+            pygame.draw.polygon(s, (255, 255, 255), [(21 + i * 8, y0 + 39), (25 + i * 8, y0 + 46), (29 + i * 8, y0 + 39)])
+            pygame.draw.polygon(s, (255, 255, 255), [(21 + i * 8, y0 + 55), (25 + i * 8, y0 + 48), (29 + i * 8, y0 + 55)])
+    else:
+        pygame.draw.rect(s, (30, 0, 0), (19, y0 + 42, 32, 9), border_radius=3)
+        for i in range(4):
+            pygame.draw.polygon(s, (255, 255, 255), [(21 + i * 8, y0 + 42), (25 + i * 8, y0 + 48), (29 + i * 8, y0 + 42)])
+    return s
+
+
+def _white(s):
+    w = s.copy()
+    w.fill((255, 255, 255, 255), special_flags=pygame.BLEND_RGBA_MAX)
+    return w
+
+
+LAYERS, pollen = {}, []
+
+
+def build_art():
+    run = []
+    for i in range(6):
+        ph = i / 6 * 6.2832
+        bob = int(abs(math.cos(ph)) * -2)
+        run.append(_hero_frame(((38 + math.sin(ph + 3.1416) * 10, 68), (38 + math.sin(ph) * 10, 68)), bob, False))
+    idle = [_hero_frame(((33, 68), (43, 68)), 0, False),
+            _hero_frame(((33, 68), (43, 68)), 1, False),
+            _hero_frame(((33, 68), (43, 68)), 0, True)]
+    for name, frames in (("hero_run", run), ("hero_idle", idle),
+                         ("hero_jump", [_hero_frame(((31, 62), (47, 60)), -2, False)]),
+                         ("hero_fall", [_hero_frame(((29, 66), (49, 62)), 1, False)])):
+        ART[name] = [(f, _white(f)) for f in frames]
+    walkers = [_walker_frame(sh, bl) for sh, bl in ((0, False), (3, False), (0, True), (-3, False))]
+    ART["walker"] = [(f, _white(f)) for f in walkers]
+    bats = [_bat_frame(wy) for wy in (-9, -2, 5, 9)]
+    ART["bat"] = [(f, _white(f)) for f in bats]
+    for mouth in ("idle", "shoot"):
+        frames = [_boss_frame(mouth == "shoot", b) for b in (0, 2)]
+        ART["boss_" + mouth] = [(f, _white(f)) for f in frames]
+
+    far = pygame.Surface((700, 300), pygame.SRCALPHA)
+    for x, w_, h_ in ((0, 320, 150), (220, 380, 190), (480, 300, 140)):
+        pygame.draw.ellipse(far, (132, 168, 205), (x, 300 - h_, w_, h_ * 2))
+        pygame.draw.ellipse(far, (150, 184, 218), (x + 30, 300 - h_ + 14, w_ // 2, h_ - 20))
+    kx = 380
+    pygame.draw.rect(far, (108, 140, 178), (kx, 140, 44, 60))
+    pygame.draw.polygon(far, (108, 140, 178), [(kx - 6, 140), (kx + 22, 104), (kx + 50, 140)])
+    pygame.draw.rect(far, (108, 140, 178), (kx + 50, 155, 20, 45))
+    pygame.draw.polygon(far, (108, 140, 178), [(kx + 46, 155), (kx + 60, 126), (kx + 74, 155)])
+    pygame.draw.rect(far, (90, 118, 155), (kx + 18, 160, 8, 14))
+    LAYERS["far"] = far
+
+    mtn = pygame.Surface((640, 340), pygame.SRCALPHA)
+    for px, pw, ph in ((30, 260, 190), (230, 300, 215), (440, 240, 170)):
+        apex = (px + pw // 2, 340 - ph)
+        pygame.draw.polygon(mtn, (126, 156, 190), [apex, (px, 340), (px + pw, 340)])
+        pygame.draw.polygon(mtn, (104, 132, 168), [apex, (px + pw, 340), (apex[0] + 18, 340)])
+        pygame.draw.polygon(mtn, (242, 246, 252), [(apex[0] - 24, apex[1] + 42), apex, (apex[0] + 24, apex[1] + 42),
+                                                   (apex[0] + 14, apex[1] + 54), (apex[0] - 2, apex[1] + 44),
+                                                   (apex[0] - 12, apex[1] + 58)])
+    LAYERS["mtn"] = mtn
+
+    hill = pygame.Surface((480, 220), pygame.SRCALPHA)
+    for x, w_, h_ in ((-20, 260, 120), (180, 300, 150), (380, 240, 110)):
+        pygame.draw.ellipse(hill, (96, 168, 110), (x, 220 - h_, w_, h_ * 2))
+        pygame.draw.ellipse(hill, (116, 188, 128), (x + 40, 220 - h_ + 22, w_ // 2, h_ - 30))
+    pygame.draw.rect(hill, (110, 74, 40), (236, 128, 10, 34))
+    for cx_, cy_, r in ((241, 112, 26), (224, 124, 18), (258, 124, 18)):
+        pygame.draw.circle(hill, (60, 130, 76), (cx_, cy_), r)
+        pygame.draw.circle(hill, (82, 154, 94), (cx_ - 6, cy_ - 7), r // 2)
+    for bx, by in ((120, 152), (330, 158)):
+        pygame.draw.ellipse(hill, (74, 140, 88), (bx, by, 54, 30))
+        pygame.draw.ellipse(hill, (92, 160, 102), (bx + 8, by + 4, 30, 16))
+    LAYERS["hill"] = hill
+
+    cloud = pygame.Surface((760, 170), pygame.SRCALPHA)
+    for cx, cy, sc in ((70, 50, 1.0), (250, 105, 0.8), (440, 38, 1.2), (630, 110, 0.9)):
+        pygame.draw.ellipse(cloud, (219, 228, 242), (cx - 44 * sc, cy + 4 * sc, 88 * sc, 18 * sc))
+        for dx, dy, rx, ry in ((0, 0, 46, 22), (30, -10, 34, 20), (-32, -6, 30, 16), (10, 8, 40, 15)):
+            pygame.draw.ellipse(cloud, (255, 255, 255),
+                                (cx + dx * sc - rx * sc, cy + dy * sc - ry * sc, rx * 2 * sc, ry * 2 * sc))
+    LAYERS["cloud"] = cloud
+
+    for _ in range(26):  # drifting pollen adds life to the scene
+        pollen.append({"x": random.uniform(0, W), "y": random.uniform(40, H - 60),
+                       "s": random.uniform(0.4, 1.0), "p": random.uniform(0, 6.28)})
+
+
+build_art()
+
+
+def kill_player(force=False):
+    if DBG["god"] or P.dead or (P.inv > 0 and not force):
+        return
+    global shake, flash
+    shake = 0.4
+    flash = 0.3
+    P.dead, P.dT, P.vy, P.vx = True, 0.0, -480.0, 0.0
+    burst(P.x + 11, P.y + 14, (230, 50, 50), 24, 260)
+
+
+def shoot():
+    if P.cd > 0 or P.dead:
+        return
+    P.cd = 0.35
+    for off in ((-160.0, -40.0, 80.0) if P.multi > 0 else (-40.0,)):
+        arrows.append({"x": P.x + 11 + P.face * 12, "y": P.y + 12, "vx": P.face * 480.0, "vy": off, "life": 0.7, "a": 0.0})
+
+
+def boss_alive():
+    return any(e.t == "X" and not e.dead for e in enemies)
+
+
+def safe_ahead(e, d):
+    """True if the tile in front of a walker has floor, no wall and no spike."""
+    lead = int((e.x + (e.w + 6 if d > 0 else -6)) // T)
+    row = int((e.y + e.h - 2) // T)
+    floor_t = int((e.y + e.h + 4) // T)
+    if lead < 0 or lead >= cols or not (0 <= row < ROWS):
+        return False
+    return solid(lead, floor_t) and not solid(lead, row) and grid[row][lead] != 3
+
+
+def revive(e):
+    e.x, e.y, e.vx, e.vy = e.sx, e.sy, e.svx, 0.0
+    e.dead, e.dT = False, 0.0
+    if e.t == "X":
+        e.hp, e.tm, e.fire, e.flash = e.maxhp, 0.0, 2.0, 0.0
+
+
+def hurt(e):
+    global score
+    cx, cy = e.x + e.w / 2, e.y + e.h / 2
+    if e.t == "X":
+        e.hp -= 1
+        e.flash = 0.15
+        burst(cx, cy, (255, 120, 40), 8)
+        if e.hp > 0:
+            return
+        score += 500
+        burst(cx, cy, (255, 200, 60), 50, 380)
+    else:
+        score += 30
+        burst(cx, cy, (140, 80, 200) if e.t == "b" else (170, 80, 30), 14)
+    e.dead = True
+
+
+def nearest_enemy(a):
+    best, bd = None, 1e18
+    for e in enemies:
+        if e.dead:
+            continue
+        dx, dy = e.x + e.w / 2 - a["x"], e.y + e.h / 2 - a["y"]
+        d = dx * dx + dy * dy
+        if d < bd and abs(dx) < 330 and abs(dy) < 220:
+            best, bd = e, d
+    return best
+
+
+def start_game():
+    global state, lvl, lives, score, banner, banner_txt
+    lvl, lives, score = 0, 3, 0
+    make_level(0)
+    state, banner, banner_txt = "play", 2.0, None
+
+
+# ---------------- update ----------------
+def update(dt):
+    global state, lives, score, lvl, cam, banner, banner_txt, cp, arrows, parts, t_now, fireballs, shake, flash
+    t_now += dt
+    if state != "play":
+        return
+    banner = max(0.0, banner - dt)
+    flash = max(0.0, flash - dt)
+    P.squash = 0.0 if abs(P.squash) < 0.01 else P.squash * max(0.0, 1 - dt * 6)
+    P.cd = max(0.0, P.cd - dt)
+    P.inv = max(0.0, P.inv - dt)
+    P.multi = max(0.0, P.multi - dt)
+    k = pygame.key.get_pressed()
+
+    if P.dead:
+        P.dT += dt
+        P.vy += 1400 * dt
+        P.y += P.vy * dt
+        if P.dT > 1.5:
+            lives -= 1
+            if lives <= 0:
+                state = "over"
+            else:
+                reset_player(cp)
+                P.inv, P.multi = 2.0, 0.0
+                arrows, fireballs = [], []
+                score = lvl_score
+                for e in enemies:
+                    revive(e)
+                for c in coins + powers:
+                    c["got"] = False
+    else:
+        left = k[pygame.K_LEFT] or k[pygame.K_a]
+        right = k[pygame.K_RIGHT] or k[pygame.K_d]
+        jump = k[pygame.K_SPACE] or k[pygame.K_UP] or k[pygame.K_w]
+        acc = 1800 if P.ground else 1100
+        if left and not right:
+            P.vx = max(-TUNE["max_spd"], P.vx - acc * dt)
+            P.face = -1
+        elif right and not left:
+            P.vx = min(TUNE["max_spd"], P.vx + acc * dt)
+            P.face = 1
+        else:
+            f = (1600 if P.ground else 300) * dt
+            P.vx = 0 if abs(P.vx) < f else P.vx - math.copysign(f, P.vx)
+        P.coyote -= dt
+        P.buf -= dt
+        if jump and not P.jheld:
+            P.buf = 0.12
+        P.jheld = bool(jump)
+        if P.ground:
+            P.coyote, P.air = 0.1, 1
+        if P.buf > 0 and P.coyote > 0:
+            P.vy, P.coyote, P.buf, P.ground, P.cut = TUNE["jump"], 0.0, 0.0, False, False
+            P.squash = -0.25
+        elif P.buf > 0 and P.air > 0 and not P.ground:
+            P.vy, P.air, P.buf, P.cut = TUNE["jump2"], P.air - 1, 0.0, False
+            P.squash = -0.25
+            burst(P.x + 11, P.y + P.h, (255, 255, 255), 10, 140)
+        if not jump and P.vy < -260 and not P.cut:
+            P.vy *= 0.45
+            P.cut = True
+        P.vy = min(900.0, P.vy + TUNE["grav"] * dt)
+        move_x(P, dt)
+        fall = P.vy
+        P.ground = move_y(P, dt)
+        if P.ground and fall > 420:  # landing squash + dust puff
+            P.squash = 0.35
+            burst(P.x + 11, P.y + P.h, (215, 200, 170), 8, 90)
+        if k[pygame.K_f]:
+            shoot()
+        # spikes
+        ty = int((P.y + P.h - 1) // T)
+        for x in range(int((P.x + 5) // T), int((P.x + P.w - 6) // T) + 1):
+            if 0 <= ty < ROWS and 0 <= x < cols and grid[ty][x] == 3 and P.y + P.h > ty * T + 18:
+                kill_player()
+        if P.y > H + 80:
+            kill_player(True)
+        for c in coins:
+            if not c["got"] and P.x < c["x"] + 18 and P.x + P.w > c["x"] - 4 and P.y < c["y"] + 22 and P.y + P.h > c["y"] - 4:
+                c["got"] = True
+                score += 10
+                burst(c["x"] + 7, c["y"] + 9, (255, 215, 0), 6, 120)
+        for pw in powers:
+            if not pw["got"] and abs(P.x + 11 - pw["x"] - 10) < 22 and abs(P.y + 14 - pw["y"] - 10) < 26:
+                pw["got"] = True
+                score += 50
+                if pw.get("k") == "heart":
+                    lives += 1
+                    banner, banner_txt = 1.2, "+1 LIFE"
+                    burst(P.x + 11, P.y, (255, 90, 120), 20, 250)
+                else:
+                    P.multi = 12.0
+        if boss_alive() and P.x > flag_x - 10:
+            P.x, P.vx = flag_x - 10, 0.0
+        for c in cps:
+            if not c["on"] and P.x + P.w > c["x"]:
+                c["on"] = True
+                cp = (c["x"] - 6, 13 * T - P.h)
+                banner, banner_txt = 1.6, "CHECKPOINT"
+                burst(c["x"] + 14, 12 * T, (80, 255, 120), 30, 300)
+        if P.x > flag_x and not boss_alive():
+            lvl += 1
+            score += 100
+            make_level(lvl)
+            banner, banner_txt = 2.0, None
+            flash = 0.25
+
+    # enemies
+    for e in enemies:
+        if e.dead:
+            e.dT += dt
+            if e.y <= H + 200:  # stop accelerating once the body is off-screen
+                e.vy += 1200 * dt
+                e.y += e.vy * dt
+            if e.t != "X" and e.dT > 20 and abs(e.sx - P.x) > 700:
+                revive(e)
+            continue
+        if e.t == "w":
+            sp = abs(e.svx) + 12
+            dx = P.x - e.x
+            d = 0 if (P.dead or abs(dx) > 800 or abs(dx) < 10) else (1 if dx > 0 else -1)
+            e.vy = min(800.0, e.vy + 1500 * dt)
+            e.vx = d * sp if (d and safe_ahead(e, d)) else 0.0
+            move_x(e, dt)
+            move_y(e, dt)
+        elif e.t == "b":
+            e.ph += dt * 2.5
+            dx, dy = P.x + 11 - e.x, P.y + math.sin(e.ph) * 26 - e.y
+            dist = math.hypot(dx, dy) or 1.0
+            if not P.dead and dist < 800:
+                sp = 85 + 8 * lvl
+                nx, ny = e.x + dx / dist * sp * dt, e.y + dy / dist * sp * dt
+                if solid(int((nx + 13) // T), int((ny + 10) // T)):
+                    nx, ny = e.x, e.y - 90 * dt
+                e.x, e.y = nx, min(ny, 12 * T - 24)
+            else:
+                e.y += math.sin(e.ph) * 20 * dt
+        else:
+            if abs(P.x - e.x) > 700:
+                continue
+            e.tm += dt
+            e.flash = max(0.0, e.flash - dt)
+            d = 1 if P.x > e.x else -1
+            e.vx = d * (70 + 6 * lvl)
+            e.vy = min(800.0, e.vy + 1500 * dt)
+            move_x(e, dt)
+            on = move_y(e, dt)
+            e.x = max((cols - 22) * T, min(e.x, (cols - 3) * T - e.w))
+            if on and e.tm > 2.2:
+                e.vy, e.tm = -620.0, 0.0
+            e.fire -= dt
+            if e.fire <= 0:
+                e.fire = max(0.8, 1.7 - 0.1 * lvl)
+                fireballs.append({"x": e.x + e.w / 2, "y": e.y + e.h - 22, "vx": d * 280.0, "vy": 0.0, "life": 4.0})
+        if not P.dead and overlap(P, e):
+            if e.t in ("w", "X") and P.vy > 80 and P.y + P.h - e.y < 18:
+                hurt(e)
+                P.vy = -380.0
+                P.inv = max(P.inv, 0.4)
+            else:
+                kill_player()
+
+    for fb in fireballs:
+        fb["life"] -= dt
+        fb["x"] += fb["vx"] * dt
+        fb["y"] += fb["vy"] * dt
+        if random.random() < 0.5:  # fiery trail
+            parts.append([fb["x"], fb["y"], random.uniform(-30, 30), -20, 0.35, (255, 150, 40)])
+        if solid(int(fb["x"] // T), int(fb["y"] // T)):
+            fb["life"] = 0
+        if not P.dead and abs(fb["x"] - (P.x + 11)) < 14 and abs(fb["y"] - (P.y + 14)) < 18:
+            fb["life"] = 0
+            kill_player()
+    fireballs = [f for f in fireballs if f["life"] > 0]
+    shake = max(0.0, shake - dt)
+
+    # self-aiming arrows
+    for a in arrows:
+        a["life"] -= dt
+        ang = math.atan2(a["vy"], a["vx"])
+        tgt = nearest_enemy(a)
+        if tgt:
+            want = math.atan2(tgt.y + tgt.h / 2 - a["y"], tgt.x + tgt.w / 2 - a["x"])
+            d = (want - ang + math.pi) % (2 * math.pi) - math.pi
+            turn = TUNE["turn"] * dt
+            ang += max(-turn, min(turn, d))
+        a["vx"], a["vy"], a["a"] = math.cos(ang) * TUNE["arrow_spd"], math.sin(ang) * TUNE["arrow_spd"], ang
+        px, py = a["x"], a["y"]  # previous position: stops arrows tunneling past small enemies on laggy frames
+        a["x"] += a["vx"] * dt
+        a["y"] += a["vy"] * dt
+        parts.append([a["x"], a["y"], 0, 0, 0.2, (255, 210, 74)])
+        if solid(int(a["x"] // T), int(a["y"] // T)):
+            a["life"] = 0
+        for e in enemies:
+            if e.dead:
+                continue
+            if (e.x < a["x"] < e.x + e.w and e.y < a["y"] < e.y + e.h) or \
+               (e.x < px < e.x + e.w and e.y < py < e.y + e.h):
+                a["life"] = 0
+                hurt(e)
+    arrows = [a for a in arrows if a["life"] > 0]
+    for p in parts:
+        p[4] -= dt
+        p[0] += p[2] * dt
+        p[1] += p[3] * dt
+        p[3] += 500 * dt
+    parts = [p for p in parts if p[4] > 0]
+    for q in pollen:  # ambient drifting pollen
+        q["x"] -= (10 + 14 * q["s"]) * dt
+        if q["x"] < -6:
+            q["x"], q["y"] = W + 6, random.uniform(40, H - 60)
+    target = max(0, min(cols * T - W, P.x - W * 0.4))
+    cam += (target - cam) * min(1.0, dt * 8)
+
+
+# ---------------- drawing ----------------
+def text(s, font, x, y, col=(255, 255, 255), align="left"):
+    key = (s, font, col)
+    img = _TEXT_CACHE.get(key)
+    if img is None:  # shadow + fill composited once, then reused every frame
+        if len(_TEXT_CACHE) > 400:
+            _TEXT_CACHE.clear()
+        fill = font.render(s, True, col)
+        img = pygame.Surface((fill.get_width() + 2, fill.get_height() + 2), pygame.SRCALPHA)
+        img.blit(font.render(s, True, (0, 0, 0)), (2, 2))
+        img.blit(fill, (0, 0))
+        _TEXT_CACHE[key] = img
+    tw = img.get_width() - 2
+    rx = x - tw // 2 if align == "center" else x - tw if align == "right" else x
+    screen.blit(img, (rx, y))
+
+
+def parallax_blit(surf, factor, y):
+    w = surf.get_width()
+    off = int(cam * factor) % w
+    for x in range(-off - w, W + w, w):
+        screen.blit(surf, (x, y))
+
+
+def draw_bg():
+    global _BG_GRAD
+    if _BG_GRAD is None:  # the sky gradient never changes: render it once
+        _BG_GRAD = pygame.Surface((W, H))
+        for y in range(0, H, 5):
+            t = y / H
+            pygame.draw.rect(_BG_GRAD, (int(90 + 120 * t), int(184 + 54 * t), 255), (0, y, W, 5))
+    screen.blit(_BG_GRAD, (0, 0))
+    screen.blit(radial(60, (255, 240, 170), 150), (680 - 60, 80 - 60))
+    pygame.draw.circle(screen, (255, 248, 205), (680, 80), 36)
+    pygame.draw.circle(screen, (255, 255, 242), (672, 72), 22)
+    parallax_blit(LAYERS["far"], 0.06, 60)
+    parallax_blit(LAYERS["mtn"], 0.12, 20)
+    parallax_blit(LAYERS["cloud"], 0.10, 26)
+    parallax_blit(LAYERS["hill"], 0.25, 260)
+
+
+def draw_tiles():
+    x0 = int(cam // T)
+    for y in range(ROWS):
+        for x in range(x0, min(cols, x0 + W // T + 2)):
+            v = grid[y][x]
+            if not v:
+                continue
+            exposed = v == 1 and (y == 0 or grid[y - 1][x] != 1)
+            screen.blit(tile_img(v, exposed, (x * 7 + y * 13) % 3), (x * T - int(cam), y * T))
+    fx = int(flag_x - cam)
+    pygame.draw.rect(screen, (200, 200, 210), (fx, 6 * T, 5, 7 * T))
+    pygame.draw.rect(screen, (250, 250, 255), (fx, 6 * T, 2, 7 * T))
+    pygame.draw.circle(screen, (255, 214, 70), (fx + 2, 6 * T - 2), 5)
+    for i in range(4):  # waving flag
+        yo = int(math.sin(t_now * 6 + i * 0.9) * 3)
+        rx = fx + 44 - abs(i - 1.5) * 4
+        pygame.draw.polygon(screen, (226 - i * 8, 34, 34),
+                            [(fx + 5, 6 * T + i * 8), (int(rx), 6 * T + 12 + i * 8 + yo), (fx + 5, 6 * T + (i + 1) * 8)])
+
+
+def draw_boss(e, x, y):
+    frames = ART["boss_shoot" if e.fire < 0.4 else "boss_idle"]
+    f, w = frames[int(t_now * 3) % len(frames)]
+    if e.flash > 0:
+        f = w
+    screen.blit(f, (x - 7, y + e.h - 78))
+
+
+def draw_enemies():
+    for e in enemies:
+        if e.dead and e.dT > 1:
+            continue
+        x, y = int(e.x - cam), int(e.y)
+        if x < -80 or x > W + 80:  # cull off-screen enemies
+            continue
+        if e.t == "X":
+            draw_boss(e, x, y)
+            continue
+        if e.t == "w":
+            screen.blit(ART["walker"][int(t_now * 8 + e.x * 0.07) % 4][0], (x - 2, y - 4))
+        else:
+            screen.blit(ART["bat"][int(t_now * 12 + e.ph * 3) % 4][0], (x - 7, y - 6))
+
+
+def draw_player():
+    if P.inv > 0 and not P.dead and int(t_now * 14) % 2:
+        return
+    if P.ground and abs(P.vx) > 10:
+        frames, idx = ART["hero_run"], int(t_now * 14) % 6
+    elif P.ground:
+        frames, idx = ART["hero_idle"], int(t_now * 1.6) % 3
+    elif P.vy < 0:
+        frames, idx = ART["hero_jump"], 0
+    else:
+        frames, idx = ART["hero_fall"], 0
+    surf = frames[idx][0]
+    if abs(P.squash) > 0.01:  # stretch on jump, squash on landing
+        k = 1 + P.squash * 0.9
+        surf = pygame.transform.scale(surf, (max(1, int(76 * k)), max(1, int(76 * (2 - k)))))
+    if P.face < 0:
+        surf = pygame.transform.flip(surf, True, False)
+    if P.dead:
+        surf = pygame.transform.rotate(surf, -P.dT * 460)
+    screen.blit(surf, surf.get_rect(center=(int(P.x - cam + 11), int(P.y - 3))))
+
+
+def draw_arrows():
+    global _ARROW_GLOW
+    if _ARROW_GLOW is None:
+        _ARROW_GLOW = pygame.Surface((30, 30), pygame.SRCALPHA)
+        pygame.draw.circle(_ARROW_GLOW, (255, 220, 100, 70), (15, 15), 13)
+    for a in arrows:
+        screen.blit(_ARROW_GLOW, (int(a["x"] - cam) - 15, int(a["y"]) - 15))
+        deg = int(round(-math.degrees(a["a"]))) % 360  # normalised so the cache never overflows
+        s = _ARROW_ROT.get(deg)
+        if s is None:  # the sprite only depends on its angle: cache each rotation once
+            s = pygame.Surface((40, 40), pygame.SRCALPHA)
+            pygame.draw.rect(s, (220, 220, 220), (6, 18, 22, 3))
+            pygame.draw.polygon(s, (255, 210, 74), [(28, 14), (36, 20), (28, 26)])
+            pygame.draw.rect(s, (230, 70, 70), (5, 16, 6, 2))
+            pygame.draw.rect(s, (230, 70, 70), (5, 22, 6, 2))
+            s = pygame.transform.rotate(s, deg)
+            _ARROW_ROT[deg] = s
+        screen.blit(s, s.get_rect(center=(int(a["x"] - cam), int(a["y"]))))
+    for p in parts:
+        if p[0] - cam < -8 or p[0] - cam > W + 8:
+            continue
+        sz = max(1, min(4, 1 + int(p[4] * 5)))  # shrink as they fade
+        pygame.draw.rect(screen, p[5], (int(p[0] - cam), int(p[1]), sz, sz))
+
+
+def draw_hud():
+    for i in range(min(lives, 7)):
+        draw_heart(24 + i * 28, 20, 10)
+    if lives > 7:
+        text(f"+{lives - 7}", F_SM, 24 + 7 * 28, 12)
+    text(f"Score {score}", F_MD, W // 2, 8, align="center")
+    text(f"Level {lvl + 1}", F_MD, W - 14, 8, align="right")
+    pygame.draw.rect(screen, (40, 40, 40), (14, 42, 80, 8))
+    pygame.draw.rect(screen, (255, 210, 74), (14, 42, int(80 * (1 - P.cd / 0.35)), 8))
+    text("F: bow", F_SM, 100, 40)
+    if cp:
+        pygame.draw.lines(screen, (80, 255, 120), False, [(W - 128, 52), (W - 120, 60), (W - 106, 44)], 4)
+        text("CHECKPOINT", F_SM, W - 14, 42, (120, 255, 150), "right")
+    if P.multi > 0:
+        text(f"TRIPLE SHOT {P.multi:.0f}s", F_SM, 14, 56, (255, 230, 90))
+    pygame.draw.rect(screen, (35, 40, 50), (W // 2 - 110, H - 15, 220, 8), border_radius=4)
+    prog = max(0.0, min(1.0, P.x / max(1.0, flag_x)))
+    pygame.draw.rect(screen, (110, 190, 255), (W // 2 - 110, H - 15, int(220 * prog), 8), border_radius=4)
+    pygame.draw.circle(screen, (255, 230, 100), (W // 2 - 110 + int(220 * prog), H - 11), 5)
+    pygame.draw.circle(screen, (200, 160, 40), (W // 2 - 110 + int(220 * prog), H - 11), 5, 1)
+    for e in enemies:
+        if e.t == "X" and not e.dead and P.x > (cols - 34) * T:
+            pygame.draw.rect(screen, (60, 0, 0), (W // 2 - 120, 44, 240, 12))
+            pygame.draw.rect(screen, (220, 40, 40), (W // 2 - 120, 44, int(240 * e.hp / e.maxhp), 12))
+            text("BOSS", F_SM, W // 2, 58, align="center")
+    if banner > 0 and state == "play":
+        text(banner_txt or f"Level {lvl + 1}", F_BG, W // 2, 100, align="center")
+        if banner_txt == "CHECKPOINT":
+            pygame.draw.lines(screen, (80, 255, 120), False, [(W // 2 - 40, 190), (W // 2 - 20, 215), (W // 2 + 30, 165)], 10)
+
+
+def draw_heart(cx, cy, r, col=(235, 60, 90)):
+    for c, rr in (((90, 5, 30), r + 2), (col, r)):
+        h = rr // 2 + 1
+        pygame.draw.circle(screen, c, (cx - rr // 2, cy - rr // 3), h)
+        pygame.draw.circle(screen, c, (cx + rr // 2, cy - rr // 3), h)
+        pygame.draw.polygon(screen, c, [(cx - rr, cy - rr // 6), (cx + rr, cy - rr // 6), (cx, cy + rr)])
+    pygame.draw.circle(screen, (255, 190, 200), (cx - r // 2, cy - r // 2), max(2, r // 5))
+
+
+def draw_extras():
+    global _HEART_GLOW
+    for c in cps:
+        x, base = int(c["x"] - cam), 13 * T
+        if x < -120 or x > W + 120:
+            continue
+        pygame.draw.rect(screen, (200, 200, 205), (x + 12, base - 78, 5, 78))
+        pygame.draw.circle(screen, (240, 240, 245), (x + 14, base - 80), 6)
+        if c["on"]:
+            alpha = int(50 + 30 * math.sin(t_now * 5))
+            glow = _CP_GLOW.get(alpha)
+            if glow is None:
+                glow = pygame.Surface((90, 90), pygame.SRCALPHA)
+                pygame.draw.circle(glow, (80, 255, 120, alpha), (45, 45), 40)
+                _CP_GLOW[alpha] = glow
+            screen.blit(glow, (x + 14 - 45, base - 50 - 45))
+            pygame.draw.polygon(screen, (40, 200, 90), [(x + 17, base - 76), (x + 62, base - 58), (x + 17, base - 40)])
+            pygame.draw.lines(screen, (255, 255, 255), False, [(x + 26, base - 58), (x + 33, base - 50), (x + 48, base - 66)], 4)
+            text("SAVED", F_SM, x + 14, base - 108, (120, 255, 150), "center")
+        else:
+            pygame.draw.polygon(screen, (130, 130, 140), [(x + 17, base - 76), (x + 62, base - 58), (x + 17, base - 40)])
+            text("CHECKPOINT", F_SM, x + 14, base - 108, (255, 255, 255), "center")
+    for pw in powers:
+        if pw["got"]:
+            continue
+        cx, cy = int(pw["x"] - cam + 10), int(pw["y"] + 10 + math.sin(t_now * 4) * 3)
+        if cx < -40 or cx > W + 40:
+            continue
+        if pw.get("k") == "heart":
+            if _HEART_GLOW is None:
+                _HEART_GLOW = pygame.Surface((50, 50), pygame.SRCALPHA)
+                pygame.draw.circle(_HEART_GLOW, (255, 90, 120, 60), (25, 25), 22)
+            screen.blit(_HEART_GLOW, (cx - 25, cy - 25))
+            draw_heart(cx, cy, int(11 + math.sin(t_now * 6) * 2))
+            continue
+        pts = [(cx + math.cos(i * math.pi / 5 - math.pi / 2) * (11 if i % 2 == 0 else 5),
+                cy + math.sin(i * math.pi / 5 - math.pi / 2) * (11 if i % 2 == 0 else 5)) for i in range(10)]
+        pygame.draw.polygon(screen, (255, 230, 90), pts)
+        pygame.draw.polygon(screen, (200, 140, 0), pts, 2)
+    for fb in fireballs:
+        x, y = int(fb["x"] - cam), int(fb["y"])
+        if x < -40 or x > W + 40:
+            continue
+        screen.blit(radial(20, (255, 120, 30), 170), (x - 20, y - 20))
+        pygame.draw.circle(screen, (255, 90, 20), (x, y), 9)
+        pygame.draw.circle(screen, (255, 220, 80), (x, y), 5)
+        pygame.draw.circle(screen, (255, 250, 210), (x - 2, y - 2), 2)
+
+
+def draw():
+    draw_bg()
+    if state != "title":
+        draw_tiles()
+        for c in coins:
+            if c["got"]:
+                continue
+            cx = c["x"] - cam
+            if cx < -20 or cx > W + 20:
+                continue
+            w = int(abs(math.cos(t_now * 4 + c["x"])) * 7 + 2)
+            pygame.draw.ellipse(screen, (200, 140, 0), (cx + 7 - w - 1, c["y"] - 1, w * 2 + 2, 20))
+            pygame.draw.ellipse(screen, (255, 196, 0), (cx + 7 - w, c["y"], w * 2, 18))
+            if math.cos(t_now * 4 + c["x"]) > 0.9:  # glint
+                pygame.draw.line(screen, (255, 250, 205), (cx + 4, c["y"] + 4), (cx + 10, c["y"] + 10), 2)
+                pygame.draw.line(screen, (255, 250, 205), (cx + 10, c["y"] + 4), (cx + 4, c["y"] + 10), 2)
+        draw_extras()
+        draw_enemies()
+        draw_arrows()
+        draw_player()
+        for q in pollen:
+            sz = 2 + int(q["s"])
+            pygame.draw.rect(screen, (255, 244, 180),
+                             (int(q["x"]), int(q["y"] + math.sin(t_now * 1.5 + q["p"]) * 8), sz, sz))
+        draw_hud()
+    shade = pygame.Surface((W, H), pygame.SRCALPHA)
+    if state == "title":
+        shade.fill((0, 0, 0, 140))
+        screen.blit(shade, (0, 0))
+        text("HOMING BOW BROS", F_BG, W // 2, 110, (255, 210, 74), "center")
+        text("Press F to fire - arrows lock onto enemies", F_MD, W // 2, 205, align="center")
+        text("Stomp, shoot, dodge spikes and pits. Reach the flag.", F_SM, W // 2, 250, (220, 220, 220), "center")
+        text("Tap jump = hop, hold = high, press again in mid-air = double jump", F_SM, W // 2, 275, (220, 220, 220), "center")
+        text("Press Enter to start", F_MD, W // 2, 310, align="center")
+        text("F1: developer panel    Esc: quit", F_SM, W // 2, 340, (185, 190, 205), "center")
+    elif state == "over":
+        shade.fill((120, 0, 0, 165))
+        screen.blit(shade, (0, 0))
+        text("YOU DIED", F_BG, W // 2, 150, align="center")
+        text(f"Score {score}  |  reached level {lvl + 1}", F_MD, W // 2, 230, align="center")
+        text("Press Enter to try again", F_MD, W // 2, 290, (255, 210, 74), "center")
+    if flash > 0:  # quick screen flash on damage / level clear
+        f = pygame.Surface((W, H), pygame.SRCALPHA)
+        f.fill((255, 238, 238, min(150, int(flash * 420))))
+        screen.blit(f, (0, 0))
+    if DBG["open"]:
+        draw_panel()
+
+
+# ---------------- imgui-style debug panel (F1) ----------------
+def ui_begin(x, y, w, h, title):
+    down = pygame.mouse.get_pressed()[0]
+    UI["click"] = down and not UI["down"]
+    UI["down"] = down
+    UI["mx"], UI["my"] = to_canvas(*pygame.mouse.get_pos())
+    UI["s"] = pygame.Surface((w, h), pygame.SRCALPHA)
+    UI["x"], UI["y"], UI["w"] = x, y, w
+    UI["cx"], UI["cy"] = x + 10, y + 30
+    pygame.draw.rect(UI["s"], (22, 24, 30, 228), (0, 0, w, h), border_radius=8)
+    pygame.draw.rect(UI["s"], (90, 160, 255), (0, 0, w, h), 1, border_radius=8)
+    pygame.draw.rect(UI["s"], (40, 48, 62), (1, 1, w - 2, 24))
+    UI["s"].blit(UI_F.render(title, True, (150, 200, 255)), (10, 5))
+
+
+def ui_end():
+    screen.blit(UI["s"], (UI["x"], UI["y"]))
+
+
+def ui_label(s, col=(205, 210, 220)):
+    t = UI_F.render(s, True, col)
+    UI["s"].blit(t, (UI["cx"] - UI["x"], UI["cy"] - UI["y"]))
+    UI["cy"] += t.get_height() + 3
+
+
+def ui_sep():
+    pygame.draw.line(UI["s"], (70, 80, 95), (8, UI["cy"] - UI["y"]), (UI["w"] - 8, UI["cy"] - UI["y"]))
+    UI["cy"] += 7
+
+
+def ui_check(label, val):
+    bx, by = UI["cx"] - UI["x"], UI["cy"] - UI["y"]
+    box = pygame.Rect(bx, by + 2, 14, 14)
+    hover = box.move(UI["x"], UI["y"]).collidepoint(UI["mx"], UI["my"])
+    pygame.draw.rect(UI["s"], (80, 95, 120) if hover else (55, 64, 82), box, border_radius=3)
+    if val:
+        pygame.draw.rect(UI["s"], (120, 220, 140), box.inflate(-6, -6), border_radius=2)
+    UI["s"].blit(UI_F.render(label, True, (230, 233, 240) if hover else (200, 205, 215)), (bx + 20, by))
+    UI["cy"] += 19
+    return hover and UI["click"]
+
+
+def ui_button(label, w=88, dx=0):
+    bx, by = UI["cx"] - UI["x"] + dx, UI["cy"] - UI["y"]
+    r = pygame.Rect(bx, by, w, 18)
+    hover = r.move(UI["x"], UI["y"]).collidepoint(UI["mx"], UI["my"])
+    pygame.draw.rect(UI["s"], (58, 70, 92) if hover else (40, 47, 60), r, border_radius=4)
+    pygame.draw.rect(UI["s"], (90, 105, 130), r, 1, border_radius=4)
+    t = UI_F.render(label, True, (232, 236, 244))
+    UI["s"].blit(t, (bx + (w - t.get_width()) // 2, by + 2))
+    return hover and UI["click"]
+
+
+def ui_slider(label, val, lo, hi, w=None, dx=0):
+    w = w or UI["w"] - 20
+    bx, by = UI["cx"] - UI["x"] + dx, UI["cy"] - UI["y"]
+    tr = pygame.Rect(bx, by + 15, w, 6)
+    if UI["down"] and tr.move(UI["x"], UI["y"]).inflate(0, 18).move(0, -6).collidepoint(UI["mx"], UI["my"]):
+        f = (UI["mx"] - UI["x"] - tr.x - 4) / max(1, tr.w - 8)
+        val = lo + max(0.0, min(1.0, f)) * (hi - lo)
+    UI["s"].blit(UI_F.render(f"{label}  {val:.1f}", True, (200, 205, 215)), (bx, by))
+    pygame.draw.rect(UI["s"], (45, 52, 66), tr, border_radius=3)
+    f = (val - lo) / (hi - lo)
+    kx = bx + int(f * (tr.w - 8))
+    pygame.draw.rect(UI["s"], (110, 165, 255), (tr.x, tr.y, max(4, kx - tr.x + 4), 6), border_radius=3)
+    pygame.draw.rect(UI["s"], (235, 240, 250), (kx, tr.y - 2, 8, 10), border_radius=3)
+    UI["cy"] += 30
+    return val
+
+
+def ui_graph(vals, h=34):
+    bx, by = UI["cx"] - UI["x"], UI["cy"] - UI["y"]
+    w = UI["w"] - 20
+    pygame.draw.rect(UI["s"], (30, 34, 44), (bx, by, w, h), border_radius=3)
+    if len(vals) > 1:
+        top = max(60.0, max(vals))
+        pts = [(int(bx + i * (w - 1) / (len(vals) - 1)), int(by + h - 2 - v / top * (h - 5)))
+               for i, v in enumerate(vals)]
+        pygame.draw.aalines(UI["s"], (110, 250, 160), False, pts)
+    UI["cy"] += h + 6
+
+
+def draw_panel():
+    global lvl, lives
+    ui_begin(W - 308, 8, 300, 432, "DEBUG PANEL   [F1] hide")
+    ui_label(f"{clock.get_fps():5.1f} fps", (140, 255, 170))
+    ui_graph(fps_hist)
+    ui_label(f"pos {P.x:7.1f} {P.y:6.1f}   vel {P.vx:6.1f} {P.vy:6.1f}")
+    ui_label(f"enemies {len(enemies)}  coins {len(coins)}  arrows {len(arrows)}")
+    ui_label(f"parts {len(parts)}  fireballs {len(fireballs)}  cam {cam:.0f}")
+    ui_sep()
+    if ui_check("God mode (no damage)", DBG["god"]):
+        DBG["god"] = not DBG["god"]
+    if ui_button("Triple shot"):
+        P.multi = 12.0
+    if ui_button("Respawn", dx=96) and state == "play":
+        reset_player(cp)
+        P.inv = 2.0
+    UI["cy"] += 22
+    if ui_button("Level +1"):
+        lvl += 1
+        make_level(lvl)
+    if ui_button("Level -1", dx=96) and lvl > 0:
+        lvl -= 1
+        make_level(lvl)
+    UI["cy"] += 22
+    if ui_button("Kill player", w=90):
+        kill_player(force=True)
+    if ui_button("+1 life", dx=98):
+        lives += 1
+    UI["cy"] += 22
+    ui_sep()
+    y0 = UI["cy"]
+    TUNE["max_spd"] = ui_slider("Speed", TUNE["max_spd"], 80, 460, w=138)
+    TUNE["arrow_spd"] = ui_slider("Arrow spd", TUNE["arrow_spd"], 200, 900, w=138)
+    TUNE["turn"] = ui_slider("Turn rate", TUNE["turn"], 2, 25, w=138)
+    TUNE["jump"] = -ui_slider("Jump", -TUNE["jump"], 300, 1000, w=138)
+    TUNE["jump2"] = TUNE["jump"] * 0.89
+    TUNE["grav"] = ui_slider("Gravity", TUNE["grav"], 400, 3000, w=138)
+    if GL["ok"]:  # live shader tuning next to the physics sliders
+        UI["cx"] += 150
+        UI["cy"] = y0
+        SH["bloom"] = ui_slider("Bloom", SH["bloom"], 0, 2.5, w=138)
+        SH["threshold"] = ui_slider("Thresh", SH["threshold"], 0, 1, w=138)
+        SH["sat"] = ui_slider("Saturation", SH["sat"], 0.5, 2.0, w=138)
+        SH["contrast"] = ui_slider("Contrast", SH["contrast"], 0.8, 1.5, w=138)
+        SH["vig"] = ui_slider("Vignette", SH["vig"], 0, 1.2, w=138)
+        UI["cx"] -= 150
+        UI["cy"] = y0 + 180
+    ui_end()
+
+
+def present():
+    """Scale the 800x450 canvas to the borderless window; GPU post-processing when available."""
+    if not GL["ok"]:
+        s = min(WIN_W / W, WIN_H / H)
+        dw, dh = int(W * s), int(H * s)
+        window.fill((0, 0, 0))
+        window.blit(pygame.transform.scale(screen, (dw, dh)), ((WIN_W - dw) // 2, (WIN_H - dh) // 2))
+        pygame.display.flip()
+        return
+    GL["tex"].write(pygame.image.tobytes(screen, "RGB"))
+    # 1) bright pass, downsampled to quarter res
+    GL["fbo_a"].use()
+    GL["prog_bright"]["u_tex"].value = 0
+    GL["prog_bright"]["u_threshold"].value = SH["threshold"]
+    GL["tex"].use(0)
+    GL["vao_bright"].render(moderngl.TRIANGLE_STRIP)
+    # 2) separable blur, ping-pong a -> b -> a
+    p = GL["prog_blur"]
+    p["u_tex"].value = 0
+    GL["fbo_b"].use()
+    GL["fbo_a"].color_attachments[0].use(0)
+    p["u_dir"].value = (1.0 / GL["qw"], 0.0)
+    GL["vao_blur"].render(moderngl.TRIANGLE_STRIP)
+    GL["fbo_a"].use()
+    GL["fbo_b"].color_attachments[0].use(0)
+    p["u_dir"].value = (0.0, 1.0 / GL["qh"])
+    GL["vao_blur"].render(moderngl.TRIANGLE_STRIP)
+    # 3) final composite: grade + bloom + vignette
+    GL["ctx"].screen.use()
+    p = GL["prog_final"]
+    p["u_tex"].value = 0
+    p["u_bloom_tex"].value = 1
+    p["u_scale"].value = GL["scale"]
+    p["u_bloom"].value = SH["bloom"]
+    p["u_sat"].value = SH["sat"]
+    p["u_contrast"].value = SH["contrast"]
+    p["u_vig"].value = SH["vig"]
+    p["u_time"].value = t_now
+    GL["tex"].use(0)
+    GL["fbo_a"].color_attachments[0].use(1)
+    GL["vao_final"].render(moderngl.TRIANGLE_STRIP)
+    pygame.display.flip()
+
+
+# ---------------- main loop ----------------
+def main():
+    make_level(0)
+    while True:
+        dt = min(1 / 30, clock.tick(60) / 1000)
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT or (ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE):
+                pygame.quit()
+                sys.exit()
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_RETURN and state in ("title", "over"):
+                start_game()
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_F1:
+                DBG["open"] = not DBG["open"]
+        update(dt)
+        draw()
+        present()
+        fps_hist.append(clock.get_fps())
+        del fps_hist[:-140]
+        if shake > 0:
+            snap = screen.copy()
+            screen.fill((0, 0, 0))
+            screen.blit(snap, (random.randint(-5, 5), random.randint(-5, 5)))
+        pygame.display.flip()
+
+
+if __name__ == "__main__":
+    main()
