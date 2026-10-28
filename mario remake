@@ -515,8 +515,8 @@ LAYERS, pollen = {}, []
 
 def build_art():
     run = []
-    for i in range(6):
-        ph = i / 6 * 6.2832
+    for i in range(24):
+        ph = i / 24 * 6.2832
         bob = int(abs(math.cos(ph)) * -2)
         run.append(_hero_frame(((38 + math.sin(ph + 3.1416) * 10, 68), (38 + math.sin(ph) * 10, 68)), bob, False))
     idle = [_hero_frame(((33, 68), (43, 68)), 0, False),
@@ -624,11 +624,11 @@ def revive(e):
         e.hp, e.tm, e.fire, e.flash = e.maxhp, 0.0, 2.0, 0.0
 
 
-def hurt(e):
+def hurt(e, dmg=1):
     global score
     cx, cy = e.x + e.w / 2, e.y + e.h / 2
     if e.t == "X":
-        e.hp -= 1
+        e.hp -= dmg
         e.flash = 0.15
         burst(cx, cy, (255, 120, 40), 8)
         if e.hp > 0:
@@ -687,8 +687,7 @@ def update(dt):
                 P.inv, P.multi = 2.0, 0.0
                 arrows, fireballs = [], []
                 score = lvl_score
-                for e in enemies:
-                    revive(e)
+                # defeated mobs stay defeated - no mass respawn on death
                 for c in coins + powers:
                     c["got"] = False
     else:
@@ -775,9 +774,7 @@ def update(dt):
             if e.y <= H + 200:  # stop accelerating once the body is off-screen
                 e.vy += 1200 * dt
                 e.y += e.vy * dt
-            if e.t != "X" and e.dT > 20 and abs(e.sx - P.x) > 700:
-                revive(e)
-            continue
+            continue  # killed enemies never come back (until the next level)
         if e.t == "w":
             sp = abs(e.svx) + 12
             dx = P.x - e.x
@@ -804,17 +801,17 @@ def update(dt):
             e.tm += dt
             e.flash = max(0.0, e.flash - dt)
             d = 1 if P.x > e.x else -1
-            e.vx = d * (70 + 6 * lvl)
+            e.vx = d * (55 + 4 * lvl)
             e.vy = min(800.0, e.vy + 1500 * dt)
             move_x(e, dt)
             on = move_y(e, dt)
             e.x = max((cols - 22) * T, min(e.x, (cols - 3) * T - e.w))
-            if on and e.tm > 2.2:
+            if on and e.tm > 3.4:
                 e.vy, e.tm = -620.0, 0.0
             e.fire -= dt
             if e.fire <= 0:
-                e.fire = max(0.8, 1.7 - 0.1 * lvl)
-                fireballs.append({"x": e.x + e.w / 2, "y": e.y + e.h - 22, "vx": d * 280.0, "vy": 0.0, "life": 4.0})
+                e.fire = max(1.5, 2.8 - 0.06 * lvl)
+                fireballs.append({"x": e.x + e.w / 2, "y": e.y + e.h - 22, "vx": d * 235.0, "vy": 0.0, "life": 4.0})
         if not P.dead and overlap(P, e):
             if e.t in ("w", "X") and P.vy > 80 and P.y + P.h - e.y < 18:
                 hurt(e)
@@ -860,7 +857,7 @@ def update(dt):
             if (e.x < a["x"] < e.x + e.w and e.y < a["y"] < e.y + e.h) or \
                (e.x < px < e.x + e.w and e.y < py < e.y + e.h):
                 a["life"] = 0
-                hurt(e)
+                hurt(e, 2)  # arrows hit twice as hard as a stomp
     arrows = [a for a in arrows if a["life"] > 0]
     for p in parts:
         p[4] -= dt
@@ -965,7 +962,7 @@ def draw_player():
     if P.inv > 0 and not P.dead and int(t_now * 14) % 2:
         return
     if P.ground and abs(P.vx) > 10:
-        frames, idx = ART["hero_run"], int(t_now * 14) % 6
+        frames, idx = ART["hero_run"], int(t_now * 24) % len(ART["hero_run"])
     elif P.ground:
         frames, idx = ART["hero_idle"], int(t_now * 1.6) % 3
     elif P.vy < 0:
