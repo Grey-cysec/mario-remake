@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Homing Bow Bros — Game Flowchart</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+  :root {
+    --bg: #0d1117; --card: #161b22; --border: #30363d;
+    --ink: #e6edf3; --dim: #8b949e; --accent: #58a6ff;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 15px/1.5 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  header {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(13,17,23,.92); backdrop-filter: blur(8px);
+    border-bottom: 1px solid var(--border);
+    padding: 18px 28px; display: flex; align-items: baseline; gap: 16px; flex-wrap: wrap;
+  }
+  header h1 { margin: 0; font-size: 22px; }
+  header .sub { color: var(--dim); font-size: 13px; }
+  header .sub a { color: var(--accent); text-decoration: none; }
+  main { padding: 24px 28px 80px; display: grid; gap: 24px; }
+  section {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 12px; padding: 20px 24px 28px; overflow-x: auto;
+  }
+  section h2 { margin: 0 0 6px; font-size: 17px; color: var(--accent); }
+  section p.note { margin: 0 0 14px; color: var(--dim); font-size: 13px; }
+  .mermaid { display: flex; justify-content: center; }
+  .legend {
+    display: flex; gap: 18px; flex-wrap: wrap; font-size: 13px; color: var(--dim);
+    background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px 24px;
+  }
+  .legend b { color: var(--ink); font-weight: 600; }
+  footer { text-align: center; color: var(--dim); font-size: 12px; padding: 24px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🏹 Homing Bow Bros — Game Flowchart</h1>
+  <span class="sub">Every step, launch → game over &nbsp;·&nbsp; <a href="FLOWCHART.md">view as Markdown</a> &nbsp;·&nbsp; <a href="https://github.com/Grey-cysec/mario-remake">repository</a></span>
+</header>
+
+<div class="legend">
+  <span>⬛ <b>Rounded</b> startup / shutdown</span>
+  <span>🟦 <b>Blue</b> input &amp; events</span>
+  <span>🟩 <b>Green</b> gameplay / physics</span>
+  <span>🟨 <b>Yellow</b> rendering</span>
+  <span>🟥 <b>Red</b> damage, death &amp; reset</span>
+  <span>🟪 <b>Purple</b> decisions</span>
+</div>
+
+<main>
+  <section>
+    <h2>1. Launch</h2>
+    <p class="note">Startup, renderer selection, art build, first level generation.</p>
+    <pre class="mermaid">
+flowchart TD
+    A["Run: python3 mario remake"] --> B["pygame.init() + read desktop size"]
+    B --> C{"OpenGL 3.3 core available?"}
+    C -->|"yes"| D["GL pipeline: frame -> 800x450 canvas -> bright pass -> blur -> bloom + grade + vignette -> fullscreen"]
+    C -->|"no"| E["Fallback: plain scaled renderer"]
+    D --> F["Build art: 96-pose run cycle, idle/jump/fall, walker, bat, boss,<br/>4 parallax layers, tiles, pollen"]
+    E --> F
+    F --> G["Level 0 generated: ground, pits, bricks, spikes, coins,<br/>checkpoints, walkers, bats, boss, flag"]
+    G --> H["State = TITLE"]
+    </pre>
+  </section>
+
+  <section>
+    <h2>2. Main loop</h2>
+    <p class="note">Runs 60 times per second — exactly one screen flip per frame.</p>
+    <pre class="mermaid">
+flowchart TD
+    A["Frame start: dt = min(1/30, clock.tick(60))"] --> B["Poll events"]
+    B --> C{"Esc or Quit?"}
+    C -->|"yes"| Z["pygame.quit() -> exit"]
+    C -->|"no"| D{"Enter pressed<br/>on title / game-over?"}
+    D -->|"yes"| E["start_game(): lives=3, score=0,<br/>regenerate level, state=PLAY"]
+    D -->|"no"| F{"F1 pressed?"}
+    F -->|"yes"| G["Toggle debug panel"]
+    F -->|"no"| H["Track keydown / keyup / focus-loss<br/>in event-based key set"]
+    E --> H
+    G --> H
+    H --> I["update(dt)"]
+    I --> J["draw() -> 800x450 canvas"]
+    J --> K["present() -> shader composite<br/>-> screen (1 flip per frame)"]
+    K --> A
+    </pre>
+  </section>
+
+  <section>
+    <h2>3. update() — one gameplay tick</h2>
+    <p class="note">Input → physics → collision → combat → entities → camera. Death and level-advance paths included.</p>
+    <pre class="mermaid">
+flowchart TD
+    A["update(dt)"] --> B{"state = PLAY?"}
+    B -->|"no"| STOP["return (title / game-over frozen)"]
+    B -->|"yes"| C["Tick timers: banner, flash, squash,<br/>shot cooldown, invincibility, triple-shot,<br/>ground-contact probe, run-phase, displacement"]
+    C --> D{"Player dead?"}
+
+    D -->|"yes"| E["Death fall + spin for 1.5 s"]
+    E --> F{"Lives left?"}
+    F -->|"no"| G["state = GAME-OVER"]
+    F -->|"yes"| H["Lives -1, respawn at checkpoint<br/>on safe footing, 2 s invincibility,<br/>clear arrows/fireballs, reset coins,<br/>killed mobs STAY dead"]
+
+    D -->|"no"| I["Read keys (focus-safe)"]
+    I --> J["Move: accel / friction, max speed"]
+    J --> K["Jump: 0.12 s input buffer + 0.1 s coyote,<br/>variable height, double jump, squash-stretch"]
+    K --> L["Gravity, cap 900 px/s"]
+    L --> M["move_x: swept tile collision"]
+    M --> N["move_y: tile collision + 1 px ground probe<br/>(stable ground state)"]
+    N --> O{"F held?"}
+    O -->|"yes"| P["shoot(): arrow every 0.35 s<br/>=2 dmg to boss"]
+    O -->|"no"| Q{"Touching spike<br/>or below screen?"}
+    P --> Q
+    Q -->|"yes"| R["kill_player(): shake + flash"]
+    Q -->|"no"| S["Coins, power-ups (+1 life / triple shot)"]
+
+    S --> T{"Boss alive<br/>at the gate?"}
+    T -->|"yes"| U["Clamp player before flag"]
+    T -->|"no"| V{"Past the flag?"}
+    V -->|"yes"| W["Score +100, level +1,<br/>regenerate level, flash"]
+    V -->|"no"| X["Checkpoints: save respawn,<br/>banner + heal burst"]
+
+    H --> EN
+    R --> EN
+    W --> EN
+    U --> EN
+    X --> EN
+
+    subgraph EN["Entities"]
+        EN1["Walkers: patrol toward player,<br/>freeze legs when standing"]
+        EN2["Bats: sine-wave chase within 800 px"]
+        EN3["Boss: walk, hop every 3.4 s,<br/>fireball every 1.5-2.8 s"]
+        EN4["Arrows: home to nearest enemy,<br/>prev-position hit test, die on wall"]
+        EN5["Fireballs: player contact = death,<br/>fiery trail, die on wall"]
+        EN6["Particles + drifting pollen"]
+    end
+    EN --> Y["Camera follows player, shake decay"]
+    Y --> STOP
+    </pre>
+  </section>
+
+  <section>
+    <h2>4. Combat &amp; scoring detail</h2>
+    <p class="note">Hit resolution for arrows, stomps, and enemy persistence.</p>
+    <pre class="mermaid">
+flowchart TD
+    A{"Arrow hits enemy?"} -->|"walker / bat"| B["One hit = kill, +30 score,<br/>burst, body falls then freezes"]
+    A -->|"boss"| C["Boss -2 HP, white flash,<br/>+500 on kill"]
+    A -->|"wall / 0.7 s old"| D["Arrow despawns"]
+    E{"Player touches enemy?"} -->|"stomp: falling on top"| F["Enemy takes 1 dmg (stomp),<br/>player bounces -380"]
+    E -->|"side / below"| G["kill_player()"]
+    H{"Enemy died?"} --> I["Stays dead for this level —<br/>no respawn on death or reset"]
+    </pre>
+  </section>
+
+  <section>
+    <h2>5. draw() + present() — every frame</h2>
+    <p class="note">Layer order top → bottom, then shader composite to screen.</p>
+    <pre class="mermaid">
+flowchart TD
+    A["draw()"] --> B["Sky gradient + sun halo<br/>4 parallax layers: ridge, mountains, clouds, hills"]
+    B --> C["Tiles: only visible columns,<br/>grass caps, flowers, waving flag"]
+    C --> D["Coins with spin + glint, checkpoints, power-ups,<br/>boss health bar, flag pole"]
+    D --> E["Enemies (animated, off-screen culled)"]
+    E --> F["Arrows with glow trail"]
+    F --> G["Player: idle / run 96-pose / jump / fall,<br/>blink when invincible, squash-stretch, death spin"]
+    G --> H["Pollen + HUD: score, lives, level,<br/>power timer, progress bar"]
+    H --> I["Overlays: title, level banner,<br/>game-over, screen flash"]
+    I --> J{"F1 panel open?"}
+    J -->|"yes"| K["Debug panel: FPS graph, god mode,<br/>buttons, physics + shader sliders"]
+    J -->|"no"| L["present()"]
+    K --> L
+    L --> M{"GL available?"}
+    M -->|"yes"| N["Upload canvas -> bright pass<br/>-> horizontal + vertical blur<br/>-> final: bloom, saturation, contrast,<br/>vignette, film grain, letterbox"]
+    M -->|"no"| O["Scale to window with letterbox"]
+    N --> P["display.flip() — exactly once"]
+    O --> P
+    </pre>
+  </section>
+
+  <section>
+    <h2>6. State summary</h2>
+    <table style="border-collapse:collapse; width:100%; font-size:14px">
+      <tr style="color:var(--dim); text-align:left">
+        <th style="padding:8px 12px; border-bottom:1px solid var(--border)">State</th>
+        <th style="padding:8px 12px; border-bottom:1px solid var(--border)">Entered when</th>
+        <th style="padding:8px 12px; border-bottom:1px solid var(--border)">Exits when</th>
+      </tr>
+      <tr>
+        <td style="padding:8px 12px; border-bottom:1px solid var(--border)"><code>title</code></td>
+        <td style="padding:8px 12px; border-bottom:1px solid var(--border)">Launch</td>
+        <td style="padding:8px 12px; border-bottom:1px solid var(--border)">Enter pressed</td>
+      </tr>
+      <tr>
+        <td style="padding:8px 12px; border-bottom:1px solid var(--border)"><code>play</code></td>
+        <td style="padding:8px 12px; border-bottom:1px solid var(--border)">Enter on title / restart</td>
+        <td style="padding:8px 12px; border-bottom:1px solid var(--border)">Death with 0 lives</td>
+      </tr>
+      <tr>
+        <td style="padding:8px 12px; border-bottom:1px solid var(--border)"><code>over</code></td>
+        <td style="padding:8px 12px; border-bottom:1px solid var(--border)">Lives run out</td>
+        <td style="padding:8px 12px; border-bottom:1px solid var(--border)">Enter → new game</td>
+      </tr>
+      <tr>
+        <td style="padding:8px 12px"><code>(quit)</code></td>
+        <td style="padding:8px 12px">Esc / window close</td>
+        <td style="padding:8px 12px">Process ends</td>
+      </tr>
+    </table>
+  </section>
+</main>
+
+<footer>Homing Bow Bros · pygame + moderngl · flowchart generated from the game source</footer>
+
+<script>
+  mermaid.initialize({
+    startOnLoad: true,
+    theme: "dark",
+    themeVariables: {
+      background: "#161b22",
+      primaryColor: "#1f6feb33",
+      primaryBorderColor: "#58a6ff",
+      primaryTextColor: "#e6edf3",
+      lineColor: "#8b949e",
+      secondaryColor: "#23863633",
+      tertiaryColor: "#da363333",
+      fontFamily: "-apple-system, 'Segoe UI', Helvetica, Arial, sans-serif",
+      fontSize: "14px"
+    },
+    flowchart: { curve: "basis", padding: 12, htmlLabels: true }
+  });
+</script>
+</body>
+</html>
