@@ -158,6 +158,22 @@ P.dead, P.dT, P.cd, P.inv, P.multi = False, 0.0, 0.0, 0.0, 0.0
 P.cut, P.air = False, 1
 P.squash = 0.0
 P.rph = 0.0  # run-cycle phase, integrated smoothly every frame
+P.lx, P.prog = 0.0, 0.0  # signed net displacement: wall-jitter nets to 0, real running doesn't
+FOCUS = {"lost": False}
+EV_KEYS = set()  # keydowns seen since start / last focus loss
+
+
+class _EvKeys:
+    """Keyboard state that requires a fresh keydown after any focus loss.
+
+    SDL misses KEYUP events while the window is unfocused, which leaves keys
+    'stuck' and made the character auto-run on its own.
+    """
+    def __init__(self, sdl):
+        self.sdl = sdl
+
+    def __getitem__(self, key):
+        return self.sdl[key] and key in EV_KEYS
 
 
 def make_level(n):
@@ -215,7 +231,7 @@ def make_level(n):
         for _ in range(r.randint(1, 2 + min(n, 2))):
             e = Body((a + 3 + r.random() * max(1, ln - 5)) * T, 12 * T, 24, 24)
             e.t, e.vx = "w", r.choice((-1, 1)) * (45 + n * 10)
-            e.dead, e.dT = False, 0.0
+            e.dead, e.dT, e.wph = False, 0.0, 0.0  # wph: walk cycle phase, only advances while moving
             enemies.append(e)
         if r.random() < 0.5 + n * 0.1:
             by = (5 + r.random() * 4) * T
@@ -281,6 +297,7 @@ def reset_player(at=None):
     P.cd = 0.0
     P.squash = 0.0
     P.rph = 0.0
+    P.lx, P.prog = P.x, 0.0
 
 
 def solid(tx, ty):
@@ -335,6 +352,12 @@ def move_y(e, dt):
         if hit:
             e.vy = 0.0
             break
+    if not on and dy >= 0:  # resting contact: gravity dips the body <1px, which the tile range
+        frow = int((e.y + e.h) // T)  # would miss - probe the row the feet touch so ground
+        for x in range(x0, x1 + 1):    # state is stable instead of flickering every other frame
+            if solid(x, frow):
+                e.y, e.vy, on = frow * T - e.h, 0.0, True
+                break
     return on
 
 
@@ -679,12 +702,16 @@ def update(dt):
     banner = max(0.0, banner - dt)
     flash = max(0.0, flash - dt)
     P.squash = 0.0 if abs(P.squash) < 0.01 else P.squash * max(0.0, 1 - dt * 6)
+    P.prog = P.prog * 0.85 + (P.x - P.lx)
+    P.lx = P.x
     if P.ground and abs(P.vx) > 10:  # integrate run phase: smooth at any fps, speed-scaled
         P.rph += dt * (1.1 + abs(P.vx) / 140.0)
     P.cd = max(0.0, P.cd - dt)
     P.inv = max(0.0, P.inv - dt)
     P.multi = max(0.0, P.multi - dt)
     k = pygame.key.get_pressed()
+    if FOCUS["lost"]:
+        k = _EvKeys(k)  # after a focus loss only a fresh keydown counts
 
     if P.dead:
         P.dT += dt
@@ -793,6 +820,7 @@ def update(dt):
             d = 0 if (P.dead or abs(dx) > 800 or abs(dx) < 10) else (1 if dx > 0 else -1)
             e.vy = min(800.0, e.vy + 1500 * dt)
             e.vx = d * sp if (d and safe_ahead(e, d)) else 0.0
+            e.wph += dt * 8 * (1 if e.vx > 0 else -1 if e.vx < 0 else 0)  # legs freeze when it stands
             move_x(e, dt)
             move_y(e, dt)
         elif e.t == "b":
@@ -965,7 +993,7 @@ def draw_enemies():
             draw_boss(e, x, y)
             continue
         if e.t == "w":
-            screen.blit(ART["walker"][int(t_now * 8 + e.x * 0.07) % 4][0], (x - 2, y - 4))
+            screen.blit(ART["walker"][int(e.wph) % 4][0], (x - 2, y - 4))
         else:
             screen.blit(ART["bat"][int(t_now * 12 + e.ph * 3) % 4][0], (x - 7, y - 6))
 
@@ -973,7 +1001,7 @@ def draw_enemies():
 def draw_player():
     if P.inv > 0 and not P.dead and int(t_now * 14) % 2:
         return
-    if P.ground and abs(P.vx) > 10:
+    if P.ground and abs(P.vx) > 10 and abs(P.prog) > 1.5:
         frames, idx = ART["hero_run"], int((P.rph % 1.0) * len(ART["hero_run"])) % len(ART["hero_run"])
     elif P.ground:
         frames, idx = ART["hero_idle"], int(t_now * 1.6) % 3
@@ -1344,6 +1372,13 @@ def main():
                 start_game()
             if ev.type == pygame.KEYDOWN and ev.key == pygame.K_F1:
                 DBG["open"] = not DBG["open"]
+            if ev.type == pygame.KEYDOWN:
+                EV_KEYS.add(ev.key)
+            elif ev.type == pygame.KEYUP:
+                EV_KEYS.discard(ev.key)
+            elif ev.type == pygame.WINDOWFOCUSLOST:
+                FOCUS["lost"] = True
+                EV_KEYS.clear()
         update(dt)
         draw()
         if shake > 0:  # camera shake must happen before the frame is presented
